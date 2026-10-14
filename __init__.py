@@ -13,6 +13,7 @@ import re
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
+from .attribute_policy import NexusAttributePolicy, parse_policy, verify_person_features
 
 
 def _strict_json(value):
@@ -196,7 +197,7 @@ def _features(tags):
     items=[x.strip().lower().replace(" ","_") for x in tags.split(",") if x.strip()]
     if len(items)<2:
         raise ValueError("canonical cast has no series/character_id")
-    clothes=("_blazer","_uniform","_dress","_skirt","_shirt","_coat","_jacket","_hoodie","_kimono","_pants","_suit","_sweater","_tie","_clothes","_sleeves","_sash","_hakama")
+    clothes=("_blazer","_uniform","_dress","_skirt","_shirt","_coat","_jacket","_hoodie","_kimono","_pants","_suit","_sweater","_tie","_clothes","_sleeves","_sash","_hakama","_collar")
     hair_shapes={"bangs","ahoge","ponytail","twintails","braid","braided_hair","hair_bun","single_side_bun","side_ponytail","hime_cut","hair_over_one_eye","hair_over_eyes"}
     eye_noncolors={"closed_eyes","half_closed_eyes","wide_eyes","narrow_eyes","half_open_eyes"}
     eye_tags={t for t in items if t.endswith("_eyes")}
@@ -624,7 +625,7 @@ def _validate_canonical_prompt_inputs(cast, planner):
             _reject_impact_control_syntax(value)
 
 
-def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,contact_protected=False,preserve_observed=False,character_ids=None,face_only_unknown_contact=False):
+def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,contact_protected=False,preserve_observed=False,character_ids=None,face_only_unknown_contact=False,attribute_policy=None):
     obj=_strict_json(response)
     items=obj.get("bindings")
     if not isinstance(items,list) or len(items)!=len(segs[1]):
@@ -648,14 +649,25 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
                       if isinstance(r.get("character_id"),str)
                       and r.get("character_id") in canonical_ids)
     if set(missing) & set(counts):raise ValueError("missing slot contradicts visible actor")
+    cfg=attribute_policy or parse_policy(modern=face_only_unknown_contact)
     eligible=[];audit=[]
+    face_only_wardrobe_slots=set()
     for index in range(len(items)):
         r=found[index]
         slot=r.get("slot")
         evidence=r.get("identity_evidence")
-        match_ok,match_reason=(_match_details(r,slot,cast,character_ids)
-                              if type(slot)==int and slot in cast
-                              else (False,"INVALID_LOGICAL_SLOT"))
+        if type(slot)==int and slot in cast:
+            if face_only_unknown_contact:
+                verified=verify_person_features(r,slot,cast,character_ids,cfg)
+                match_ok,match_reason=verified["ok"],verified["reason"]
+            else:
+                match_ok,match_reason=_match_details(r,slot,cast,character_ids)
+                verified={"ok":match_ok,"reason":match_reason,
+                          "body_allowed":match_ok,"unverified_wardrobe":[]}
+        else:
+            match_ok,match_reason=False,"INVALID_LOGICAL_SLOT"
+            verified={"ok":False,"reason":match_reason,
+                      "body_allowed":False,"unverified_wardrobe":[]}
         identity_ok=(type(slot)==int and slot in cast and counts[slot]==1
             and isinstance(r.get("character_id"),str)
             and id_counts[r["character_id"]]==1
@@ -683,9 +695,12 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
                     break
         if issue is None:
             eligible.append((index,slot))
+            if not verified["body_allowed"]:
+                face_only_wardrobe_slots.add(slot)
         audit.append({"instance_index":index,"slot":slot if type(slot)==int and slot in cast else None,
                       "status":"PRESENT_CONFIRMED" if issue is None else "PRESENT_UNCERTAIN",
-                      "reason":issue,"feature_match":match_reason})
+                      "reason":issue,"feature_match":match_reason,
+                      "unverified_wardrobe":verified["unverified_wardrobe"]})
     # Contact props can fall inside a person SEG. Never trust a canonical owner
     # while any relevant visible participant claims contradictory prop evidence.
     by_slot={slot:index for index,slot in eligible}
@@ -750,8 +765,13 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
         entry["status"]="PRESENT_UNCERTAIN"
         entry["reason"]="CONTACT_OWNER_OR_SHARED_PROP_UNVERIFIED"
     face_only_contact_slots-=blocked_slots
+    face_only_wardrobe_slots-=blocked_slots
     for slot in face_only_contact_slots:
         audit[by_slot[slot]]["body_policy"]=contact_reasons.get(slot,"FACE_ONLY_CONTACT_UNKNOWN")
+    for slot in face_only_wardrobe_slots:
+        audit[by_slot[slot]].setdefault("body_policy",
+            "FACE_ONLY_WARDROBE_UNVERIFIED" if cfg["mode"]!="face_only"
+            else "FACE_ONLY_POLICY_SELECTED")
     used_slots={slot for _,slot in candidates}
     if not candidates:
         reasons=[{"instance_index":r["instance_index"],"slot":r["slot"],
@@ -782,6 +802,9 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
         "accepted":[{"instance_index":i,"slot":slot} for i,slot,_ in accepted],
         "people":audit,"missing":missing_status,"generated_person_count":len(accepted),
         "face_only_contact_slots":sorted(face_only_contact_slots),
+        "face_only_wardrobe_slots":sorted(face_only_wardrobe_slots),
+        "attribute_policy":{"mode":cfg["mode"],
+                             "wardrobe_alias_count":len(cfg["wardrobe_aliases"])},
         "contact_evaluations":contact_evaluations,
         "protection_limits":{"mask_outside_union":"COMPOSITOR_POLICY_STATIC_ONLY",
          "contact_props_inside_union":"NOT_PIXEL_PROVEN",
@@ -1043,30 +1066,33 @@ class NexusImpactBind:
         "logical3":("STRING",{"forceInput":True}),"logical4":("STRING",{"forceInput":True}),
         "raw_person_segs":("SEGS",),
         "prop_review_id":("STRING",{"default":""})},
-        "optional":{"manual_prop_mask":("MASK",),"geometry_report":("STRING",{"forceInput":True}),"image":("IMAGE",),"identity_ledger":("STRING",{"forceInput":True})}}
+        "optional":{"manual_prop_mask":("MASK",),"geometry_report":("STRING",{"forceInput":True}),"image":("IMAGE",),"identity_ledger":("STRING",{"forceInput":True}),
+                    "attribute_policy":("STRING",{"forceInput":True})}}
     RETURN_TYPES=("SEGS","STRING","STRING","MASK","MASK","SEGS","STRING","MASK","MASK","BOOLEAN","BOOLEAN","BOOLEAN")
     RETURN_NAMES=("confirmed_person_SEGS","exact_wildcard","audit","verified_union_mask","background_edit_mask",
         "confirmed_face_SEGS","face_wildcard","face_union_mask","body_soft_mask","background_enabled","body_enabled","face_enabled")
     FUNCTION="bind"
     CATEGORY="Eagle Nexus/Existing-node bridge"
 
-    def bind(self,safe_segs,vlm_response,planner,scene,active_count,logical1,logical2,logical3,logical4,raw_person_segs=None,prop_review_id="",manual_prop_mask=None,geometry_report=None,image=None,identity_ledger=None):
+    def bind(self,safe_segs,vlm_response,planner,scene,active_count,logical1,logical2,logical3,logical4,raw_person_segs=None,prop_review_id="",manual_prop_mask=None,geometry_report=None,image=None,identity_ledger=None,attribute_policy=None):
         try:
             return self._bind_checked(
                 safe_segs,vlm_response,planner,scene,active_count,logical1,logical2,logical3,logical4,
                 raw_person_segs=raw_person_segs,prop_review_id=prop_review_id,
                 manual_prop_mask=manual_prop_mask,geometry_report=geometry_report,
-                image=image,identity_ledger=identity_ledger)
+                image=image,identity_ledger=identity_ledger,
+                attribute_policy=attribute_policy)
         except Exception as exc:
             _persist_bind_failure(exc,vlm_response,geometry_report,active_count)
             raise
 
-    def _bind_checked(self,safe_segs,vlm_response,planner,scene,active_count,logical1,logical2,logical3,logical4,raw_person_segs=None,prop_review_id="",manual_prop_mask=None,geometry_report=None,image=None,identity_ledger=None):
+    def _bind_checked(self,safe_segs,vlm_response,planner,scene,active_count,logical1,logical2,logical3,logical4,raw_person_segs=None,prop_review_id="",manual_prop_mask=None,geometry_report=None,image=None,identity_ledger=None,attribute_policy=None):
         if type(active_count)!=int or not 1<=active_count<=4:
             raise ValueError("expected logical people must be in 1..4")
         cast={i:v for i,v in enumerate((logical1,logical2,logical3,logical4),1) if i<=active_count}
         if any(not v.strip() for v in cast.values()):raise ValueError("empty canonical cast")
         modern=geometry_report is not None
+        config=parse_policy(attribute_policy,modern=modern)
         character_ids=_ledger_ids(identity_ledger,cast) if modern else None
         char_ids=list(character_ids.values()) if modern else [_features(value)["character_id"] for value in cast.values()]
         if len(char_ids)!=len(set(char_ids)):raise ValueError("duplicate logical identity")
@@ -1082,7 +1108,8 @@ class NexusImpactBind:
             if meta.get("raw_body_hash")!=hashlib.sha256(np.packbits(actual_body).tobytes()).hexdigest():raise ValueError("Raw body changed after observation")
         selected,wildcard,audit=_bind_response(vlm_response,safe_segs,cast,contract,scene,
                                              require_ownership=modern,contact_protected=modern,preserve_observed=modern,character_ids=character_ids,
-                                             face_only_unknown_contact=modern)
+                                             face_only_unknown_contact=modern,
+                                             attribute_policy=config)
         if modern and (meta.get("skipped") or meta.get("unassigned_raw_person_regions")):
             for row in audit["missing"]:
                 row["status"]="UNCONFIRMED";row["reason"]="OTHER_DETECTED_FACES_EXCLUDED_NOT_PROVEN_MISSING"
@@ -1093,6 +1120,7 @@ class NexusImpactBind:
             pairs=[(x["instance_index"],x["slot"]) for x in audit["accepted"]];accepted_slots={slot for _,slot in pairs}
             observations={r["instance_index"]:r for r in _strict_json(vlm_response)["bindings"]}
             face_only_slots=set(audit.get("face_only_contact_slots",[]))
+            face_only_slots.update(audit.get("face_only_wardrobe_slots",[]))
             observed_plan=dict(contract);intent=[]
             for index,slot in pairs:
                 observed=observations[index]
@@ -1177,5 +1205,8 @@ class NexusImpactBind:
                 bool(background_mask.any()),bool(verified_mask.any()),bool(face_union.any()))
 
 
-NODE_CLASS_MAPPINGS={"NexusImpactPrepare":NexusImpactPrepare,"NexusImpactBind":NexusImpactBind}
-NODE_DISPLAY_NAME_MAPPINGS={"NexusImpactPrepare":"Nexus | 全身SEGS番号付き観測","NexusImpactBind":"Nexus | 本人SEGS確定とCatFlat分離"}
+NODE_CLASS_MAPPINGS={"NexusImpactPrepare":NexusImpactPrepare,"NexusImpactBind":NexusImpactBind,
+                     "NexusAttributePolicy":NexusAttributePolicy}
+NODE_DISPLAY_NAME_MAPPINGS={"NexusImpactPrepare":"Nexus | 全身SEGS番号付き観測",
+                            "NexusImpactBind":"Nexus | 本人SEGS確定とCatFlat分離",
+                            "NexusAttributePolicy":"Nexus | 属性照合ポリシー（選択式）"}
