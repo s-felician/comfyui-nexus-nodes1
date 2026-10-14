@@ -455,40 +455,137 @@ def _relation_has_contact_risk(rel):
             or bool(re.search(r"\b(?:hand\w*|hold\w*|touch\w*|grasp\w*|grip\w*|hug\w*|contact|carry\w*|restrain\w*|press\w*|push\w*|pull\w*|support\w*)\b",txt)))
 
 
-def _observed_contact_matches(record, rel):
-    """Verify claimed owner/object tokens; this is not pixel-level protection."""
-    text=record.get("observed_contact")
-    if not _observed_field_known(text):
-        return False
-    observed=_normalized_observation(text)
-    if re.search(r"\b(?:no|not|never|without|maybe|unclear|unsure)\b",observed):
-        return False
-    # The photographed subject is a relation target, not an owner of the
-    # camera. Only visible_geometry can specify who physically holds the prop.
-    declared=_normalized_observation(str(rel.get("visible_geometry","")))
-    expected_owners=set(re.findall(r"\bslot[1-4]\b",declared))
-    if not expected_owners:
-        expected_owners={rel["source"]}
-    if not all(re.search(r"\b"+re.escape(owner)+r"\b",observed) for owner in expected_owners):
-        return False
-    claimed_holders=set(re.findall(
-        r"\b(slot[1-4])\s+(?:hold\w*|carry\w*|carrying|grasp\w*|grip\w*|use\w*)\b",
-        observed))
-    if claimed_holders and not claimed_holders.issubset(expected_owners):
-        return False
-    objects={obj for obj in _CONTACT_OBJECTS
-             if re.search(r"\b"+re.escape(obj)+r"\b",declared)}
+# Contact status is separate from CHARACTER identity: uncertain physical
+# relations can disable body edits without invalidating a verified safe face.
+_CONTACT_MATCH="MATCH"
+_CONTACT_UNKNOWN="UNKNOWN"
+_CONTACT_CONTRADICTED="CONTRADICTED"
+
+
+def _contact_refs(text, instance_to_slot=None):
+    """Resolve observed P# to original logical slot via VLM's checked binding.
+
+    P0 is detection order, NOT necessarily slot1. Unknown P# must not be
+    guessed from X coordinates or silently discarded.
+    """
+    unresolved=[]
+    def convert(match):
+        number=int(match.group(1))
+        slot=None if instance_to_slot is None else instance_to_slot.get(number)
+        if type(slot)!=int or not 1<=slot<=4:
+            unresolved.append(number)
+            return "unmapped_person_reference"
+        return f"slot{slot}"
+    converted=re.sub(r"\bp(\d+)\b",convert,text,flags=re.I)
+    return _normalized_observation(converted),bool(unresolved)
+
+
+def _strip_negated_object_claims(text):
+    """Ignore *absent* props for person contact and background prop scanning.
+
+    This is deliberately narrow: positive 'holding a camera' is untouched,
+    and an actual Planner object relation still overrides any VLM denial.
+    """
+    return re.sub(
+        r"\b(?:no|without)\s+(?:(?:visible|physical|handheld|hand held|separate|any)\s+){0,2}"
+        r"(?:object\s+)?(?:props?|objects?|items?)\b"
+        r"|\bnot\s+holding\s+(?:an?\s+|the\s+)?(?:separate\s+)?(?:props?|objects?|items?)\b",
+        " ",text,flags=re.I)
+
+
+def _object_holders(text,objects):
+    """Recognize only an explicit physical holder, not an incidental actor."""
+    holders=set()
+    for obj in objects:
+        o=re.escape(obj)
+        patterns=(
+            r"\b(slot[1-4])\s+(?:hold\w*|carry\w*|carrying|grasp\w*|grip\w*|use\w*)\s+(?:a\s+|an\s+|the\s+)?"+o+r"\b",
+            r"\b"+o+r"\s+(?:is\s+)?(?:in|held by|carried by)\s+(?:the\s+)?(slot[1-4])\s*(?:hands?|arms?)?\b",
+            r"\b(slot[1-4])\s+(?:hands?|arms?)\s+(?:hold\w*|grasp\w*|grip\w*)\s+(?:the\s+)?"+o+r"\b",
+        )
+        for pattern in patterns:
+            holders.update(re.findall(pattern,text))
+    return holders
+
+
+def _contact_verdict(record,rel,instance_to_slot=None):
+    """MATCH / UNKNOWN / CONTRADICTED based on explicit scoped evidence.
+
+    VLM text alone never proves physical ownership at the pixel level.
+    Never upgrade missing names or vague prose into a definite contradiction.
+    """
+    raw=record.get("observed_contact")
+    if not _observed_field_known(raw):
+        return _CONTACT_UNKNOWN,"CONTACT_NOT_OBSERVED"
+    observed,unresolved=_contact_refs(raw,instance_to_slot)
+    if unresolved:
+        return _CONTACT_UNKNOWN,"UNMAPPED_DETECTION_REFERENCE"
+    if ("?" in raw or re.search(
+            r"\b(?:maybe|perhaps|unclear|unsure|uncertain|seems|appears|possibly|might)\b",
+            observed)):
+        return _CONTACT_UNKNOWN,"HEDGED_CONTACT_OBSERVATION"
+
+    declared=_normalized_observation(str(rel.get("type",""))+" "+
+                                     str(rel.get("visible_geometry","")))
+    geometry=_normalized_observation(str(rel.get("visible_geometry","")))
+    expected_people={str(rel.get("source",""))}
     target=rel.get("target","")
-    if target.startswith("object:"):
-        name=_normalized_observation(target.partition(":")[2])
-        if not name or name not in observed:
-            return False
-    if not all(re.search(r"\b"+re.escape(obj)+r"\b",observed) for obj in objects):
-        return False
-    if re.search(r"\b(?:hands?|hold\w*|grasp\w*|grip\w*)\b",declared):
-        if not re.search(r"\b(?:hands?|hold\w*|held|grasp\w*|grip\w*)\b",observed):
-            return False
-    return True
+    person_relation=isinstance(target,str) and re.fullmatch(r"slot[1-4]",target) is not None
+    if person_relation:
+        expected_people.add(target)
+    objects={name for name in _CONTACT_OBJECTS
+             if re.search(r"\b"+re.escape(name)+r"\b",geometry)}
+    if isinstance(target,str) and target.startswith("object:"):
+        object_name=_normalized_observation(target.partition(":")[2])
+        if object_name:
+            objects.add(object_name)
+    negative_props=_strip_negated_object_claims(observed)
+
+    if objects:
+        if re.search(r"\b(?:no|without)\s+(?:visible\s+)?(?:object\s+)?(?:props?|objects?|items?)\b",observed):
+            return _CONTACT_CONTRADICTED,"EXPECTED_OBJECT_DENIED"
+        for name in objects:
+            if re.search(r"\b(?:no|without)\s+(?:visible\s+)?"+re.escape(name)+r"\b",observed):
+                return _CONTACT_CONTRADICTED,"EXPECTED_OBJECT_DENIED"
+        if re.search(r"\b(?:not|never)\s+(?:\w+\s+){0,2}(?:hold\w*|carry\w*|grasp\w*|grip\w*)\b",observed):
+            return _CONTACT_CONTRADICTED,"EXPECTED_OBJECT_HOLDING_DENIED"
+        if not all(re.search(r"\b"+re.escape(o)+r"\b",observed) for o in objects):
+            return _CONTACT_UNKNOWN,"OBJECT_NOT_DESCRIBED"
+        # The photographed subject may be mentioned in geometry but is not
+        # an owner; accept only actual hold/carry/in-hand phrases as evidence.
+        expected_owners=_object_holders(geometry,objects) or {rel["source"]}
+        observed_owners=_object_holders(observed,objects)
+        if observed_owners-expected_owners:
+            return _CONTACT_CONTRADICTED,"EXPLICIT_WRONG_OBJECT_OWNER"
+        if expected_owners.issubset(observed_owners):
+            return _CONTACT_MATCH,"OBJECT_AND_OWNER_RECORDED"
+        return _CONTACT_UNKNOWN,"OBJECT_OWNER_UNVERIFIED"
+
+    if person_relation:
+        clean=negative_props
+        # Only negation governing actual touch is contrary evidence. "no object
+        # prop" and "without a prop" say nothing about hand-to-hand contact.
+        if (re.search(r"\b(?:no|without)\s+(?:(?:actual|visible|physical|direct|separate)\s+){0,2}(?:hand\s+to\s+hand\s+|hand\s+)?(?:contact|touch\w*|handholding)\b",clean)
+                or re.search(r"\b(?:hands?|arms?|fingers?)\s+(?:are\s+)?(?:not|never)\s+(?:touch\w*|join\w*|hold\w*|linked|interlocked)\b",clean)
+                or re.search(r"\b(?:do|does|did|are|is|were|was|can|could|should|would|have|has)\s+not\s+(?:actually\s+)?(?:hold\w*|touch\w*|grasp\w*|join\w*|hug\w*|embrac\w*)\b",clean)
+                or re.search(r"\b(?:not|never|without)\s+(?:actually\s+)?(?:hold\w*|touch\w*|grasp\w*|join\w*|hug\w*|embrac\w*)\b",clean)
+                or re.search(r"\b(?:don\s+t|doesn\s+t|didn\s+t|cant|can\s+t)\s+(?:appear\s+to\s+)?(?:hold\w*|touch\w*|grasp\w*)\b",clean)):
+            return _CONTACT_CONTRADICTED,"EXPLICIT_CONTACT_DENIAL"
+        observed_people=set(re.findall(r"\bslot[1-4]\b",clean))
+        if observed_people and not expected_people.issubset(observed_people):
+            return _CONTACT_UNKNOWN,"CONTACT_PARTICIPANT_UNVERIFIED"
+        if (expected_people.issubset(observed_people) and re.search(
+                r"\b(?:hands?|fingers?|arms?|wrists?|hold\w*|touch\w*|joined|interlocked|grasp\w*|grip\w*|hug\w*|embrac\w*|contact)\b",clean)):
+            return _CONTACT_MATCH,"OBSERVED_PARTICIPANTS_AND_TOUCH"
+        return _CONTACT_UNKNOWN,"CONTACT_GEOMETRY_UNVERIFIED"
+    # Non-person relation without an explicitly named object: do not assert
+    # a wrong owner from words missing in a limited VLM observation.
+    return _CONTACT_UNKNOWN,"RELATION_NOT_SEMANTICALLY_RESOLVED"
+
+
+def _observed_contact_matches(record, rel):
+    """Compatibility for legacy callers; modern binding uses tri-state."""
+    return _contact_verdict(record,rel)[0]==_CONTACT_MATCH
 
 
 def _validate_canonical_prompt_inputs(cast, planner):
@@ -586,9 +683,14 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
     # Contact props can fall inside a person SEG. Never trust a canonical owner
     # while any relevant visible participant claims contradictory prop evidence.
     by_slot={slot:index for index,slot in eligible}
+    # Never assume detection order and logical cast order match. Resolve P0/P1
+    # from the very same VLM binding already verified above.
+    instance_to_slot={i:slot for i,slot in eligible}
     blocked_slots=set()
     face_only_contact_slots=set()
-    for rel in planner.get("relations",[]):
+    contact_reasons={}
+    contact_evaluations=[]
+    for relation_index,rel in enumerate(planner.get("relations",[])):
         if not _relation_has_contact_risk(rel):
             continue
         source,target=rel["source"],rel["target"]
@@ -613,22 +715,29 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
                 blocked_slots.update(int(p[4:]) for p in participants
                                      if int(p[4:]) in by_slot)
             continue
-        unknown_contact=any(not _observed_field_known(
-            found[by_slot[int(p[4:])]].get("observed_contact")) for p in participants)
-        contradictory_contact=any(
-            _observed_field_known(found[by_slot[int(p[4:])]].get("observed_contact"))
-            and not _observed_contact_matches(found[by_slot[int(p[4:])]],rel)
-            for p in participants)
-        if contradictory_contact:
-            # Incorrect ownership is a full stop, not a face-only excuse.
-            blocked_slots.update(int(p[4:]) for p in participants)
-        elif unknown_contact:
+        verdicts=[_contact_verdict(found[by_slot[int(p[4:])]],rel,instance_to_slot)
+                  for p in sorted(participants)]
+        outcome=(_CONTACT_CONTRADICTED if any(v[0]==_CONTACT_CONTRADICTED for v in verdicts)
+                 else _CONTACT_UNKNOWN if any(v[0]==_CONTACT_UNKNOWN for v in verdicts)
+                 else _CONTACT_MATCH)
+        contact_evaluations.append({
+            "relation_index":relation_index,
+            "participants":sorted(int(p[4:]) for p in participants),
+            "status":outcome,
+            "reasons":[v[1] for v in verdicts]})
+        if outcome!=_CONTACT_MATCH:
+            affected={int(p[4:]) for p in participants}
             if face_only_unknown_contact:
-                # The face still has its own verified mask and identity.
-                # The whole body's edit mask is disabled downstream.
-                face_only_contact_slots.update(int(p[4:]) for p in participants)
+                # Face-safe modern geometry is independent of whether hands or
+                # shared objects are understood. No body edit in this case.
+                face_only_contact_slots.update(affected)
+                for slot in affected:
+                    contact_reasons[slot]=("FACE_ONLY_CONTACT_CONTRADICTED"
+                                         if outcome==_CONTACT_CONTRADICTED
+                                         else contact_reasons.get(slot,"FACE_ONLY_CONTACT_UNKNOWN"))
             else:
-                blocked_slots.update(int(p[4:]) for p in participants)
+                # Legacy still has no independent face mask; fail closed.
+                blocked_slots.update(affected)
     candidates=[(index,slot) for index,slot in eligible if slot not in blocked_slots]
     for slot in blocked_slots:
         entry=audit[by_slot[slot]]
@@ -636,7 +745,7 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
         entry["reason"]="CONTACT_OWNER_OR_SHARED_PROP_UNVERIFIED"
     face_only_contact_slots-=blocked_slots
     for slot in face_only_contact_slots:
-        audit[by_slot[slot]]["body_policy"]="FACE_ONLY_CONTACT_UNKNOWN"
+        audit[by_slot[slot]]["body_policy"]=contact_reasons.get(slot,"FACE_ONLY_CONTACT_UNKNOWN")
     used_slots={slot for _,slot in candidates}
     if not candidates:
         reasons=[{"instance_index":r["instance_index"],"slot":r["slot"],
@@ -667,6 +776,7 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
         "accepted":[{"instance_index":i,"slot":slot} for i,slot,_ in accepted],
         "people":audit,"missing":missing_status,"generated_person_count":len(accepted),
         "face_only_contact_slots":sorted(face_only_contact_slots),
+        "contact_evaluations":contact_evaluations,
         "protection_limits":{"mask_outside_union":"COMPOSITOR_POLICY_STATIC_ONLY",
          "contact_props_inside_union":"NOT_PIXEL_PROVEN",
          "expression_action_after_catflat":"NOT_VISUALLY_VERIFIED"}}
@@ -705,7 +815,14 @@ def _background_prop_risk(planner, scene="", observed_vlm_response=""):
     try:
         observation=_strict_json(observed_vlm_response)
         for row in observation.get("bindings",[]):
-            if isinstance(row,dict) and isinstance(row.get("observed_gaze"),str):row["observed_gaze"]=gaze_text(row["observed_gaze"])
+            if not isinstance(row,dict):
+                continue
+            if isinstance(row.get("observed_gaze"),str):
+                row["observed_gaze"]=gaze_text(row["observed_gaze"])
+            if isinstance(row.get("observed_contact"),str):
+                # An assertion that *no* object exists cannot create a prop
+                # detection. Planner/scene prop mentions are still honored.
+                row["observed_contact"]=_strip_negated_object_claims(row["observed_contact"])
         risk_observation=json.dumps(observation)
     except (ValueError,TypeError):risk_observation=observed_vlm_response
     strings = [scene, risk_observation]
