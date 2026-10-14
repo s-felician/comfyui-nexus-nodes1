@@ -186,16 +186,31 @@ def _overlay(image,safe,face_boxes=None):
 
 
 def _features(tags):
+    """Canonical character features. Preserve hair SHAPE and color separately.
+
+    The original implementation ignored short_hair/medium_hair and therefore
+    rejected correct live C09 observations. Heterochromia is also a real
+    discriminator when the canonical entry has multiple distinct eye colors.
+    Only canonical tags (plus that logically implied marker) are eligible.
+    """
     items=[x.strip().lower().replace(" ","_") for x in tags.split(",") if x.strip()]
     if len(items)<2:
         raise ValueError("canonical cast has no series/character_id")
     clothes=("_blazer","_uniform","_dress","_skirt","_shirt","_coat","_jacket","_hoodie","_kimono","_pants","_suit","_sweater","_tie","_clothes","_sleeves","_sash","_hakama")
+    hair_shapes={"bangs","ahoge","ponytail","twintails","braid","braided_hair","hair_bun","single_side_bun","side_ponytail","hime_cut","hair_over_one_eye","hair_over_eyes"}
+    eye_noncolors={"closed_eyes","half_closed_eyes","wide_eyes","narrow_eyes","half_open_eyes"}
+    eye_tags={t for t in items if t.endswith("_eyes")}
+    eye_colors=eye_tags-eye_noncolors
+    if "heterochromia" in items or len(eye_colors)>1:
+        eye_tags.add("heterochromia")
     return {
         "character_id":items[1],
-        "hair":{t for t in items if t.endswith("_hair") and t not in ("long_hair","short_hair","medium_hair","wavy_hair","straight_hair","curly_hair")},
-        "eyes":{t for t in items if t.endswith("_eyes")},
+        "hair":{t for t in items if t.endswith("_hair") or t in hair_shapes},
+        "eyes":eye_tags,
         "accessory":{t for t in items if ("hairclip" in t or "headband" in t or "hair_ornament" in t or "hair_ribbon" in t or "hair_bow" in t or t in ("glasses","headphones","hairband","hat","necklace","earrings","brooch"))},
-        "outfit":{t for t in items if t.endswith(clothes) or t in ("obi","hakama","kimono")}
+        "outfit":{t for t in items if t.endswith(clothes)
+                  or t in {suffix[1:] for suffix in clothes}
+                  or t in ("obi","hakama","kimono")}
     }
 
 
@@ -238,23 +253,43 @@ def _ledger_ids(ledger,cast):
     return ids
 
 
-def _matches(record, slot, cast,character_ids=None):
+def _match_details(record,slot,cast,character_ids=None):
+    """Return strict match and a bounded reason, not a VLM self-assertion."""
     traits={s:_features(v) for s,v in cast.items()}
     expected=traits[slot]
-    if record.get("character_id")!=(character_ids or {}).get(slot,expected["character_id"]) or record.get("ambiguous") is not False:
-        return False
+    if record.get("character_id")!=(character_ids or {}).get(slot,expected["character_id"]):
+        return False,"CHARACTER_ID_MISMATCH"
+    if record.get("ambiguous") is not False:
+        return False,"AMBIGUOUS_IDENTITY"
     obs=record.get("observed_features")
-    if not isinstance(obs,dict):return False
+    if not isinstance(obs,dict):
+        return False,"FEATURE_OBJECT_MISSING"
     observed={}
     for key in ("hair","eyes","accessory","outfit"):
         value=obs.get(key,[])
-        if not isinstance(value,list) or any(not isinstance(x,str) for x in value):return False
-        observed[key]={x.strip().lower().replace(" ","_") for x in value if x.strip().lower() not in ("unknown","none","")}
-        if observed[key] and not observed[key].issubset(expected[key]):return False
-    if len([k for k,v in observed.items() if v])<2:return False
-    if len(expected["eyes"])>1 and observed["eyes"]!=expected["eyes"]:return False
-    candidates=[s for s,t in traits.items() if all(v.issubset(t[key]) for key,v in observed.items())]
-    return candidates==[slot]
+        if not isinstance(value,list) or any(not isinstance(x,str) for x in value):
+            return False,"INVALID_"+key.upper()+"_FEATURES"
+        observed[key]={x.strip().lower().replace(" ","_") for x in value
+                       if x.strip().lower() not in ("unknown","none","")}
+        extra=observed[key]-expected[key]
+        if extra:
+            return False,"UNSUPPORTED_"+key.upper()+"_FEATURES:"+",".join(sorted(extra))[:160]
+    if len([k for k,v in observed.items() if v])<2:
+        return False,"TOO_FEW_VISIBLE_FEATURE_CATEGORIES"
+    eye_noncolors={"closed_eyes","half_closed_eyes","wide_eyes","narrow_eyes","half_open_eyes","heterochromia"}
+    expected_eye_colors={t for t in expected["eyes"] if t.endswith("_eyes") and t not in eye_noncolors}
+    observed_eye_colors={t for t in observed["eyes"] if t.endswith("_eyes") and t not in eye_noncolors}
+    if len(expected_eye_colors)>1 and observed_eye_colors!=expected_eye_colors:
+        return False,"HETEROCHROMIA_COLORS_INCOMPLETE"
+    candidates=[s for s,t in traits.items()
+                if all(v.issubset(t[key]) for key,v in observed.items())]
+    if candidates!=[slot]:
+        return False,"NOT_UNIQUE_BY_VISIBLE_FEATURES"
+    return True,"MATCHED"
+
+
+def _matches(record,slot,cast,character_ids=None):
+    return _match_details(record,slot,cast,character_ids)[0]
 
 
 def _person_prompt(slot,cast,planner,scene,confirmed_slots):
@@ -486,7 +521,7 @@ def _validate_canonical_prompt_inputs(cast, planner):
             _reject_impact_control_syntax(value)
 
 
-def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,contact_protected=False,preserve_observed=False,character_ids=None):
+def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,contact_protected=False,preserve_observed=False,character_ids=None,face_only_unknown_contact=False):
     obj=_strict_json(response)
     items=obj.get("bindings")
     if not isinstance(items,list) or len(items)!=len(segs[1]):
@@ -515,6 +550,9 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
         r=found[index]
         slot=r.get("slot")
         evidence=r.get("identity_evidence")
+        match_ok,match_reason=(_match_details(r,slot,cast,character_ids)
+                              if type(slot)==int and slot in cast
+                              else (False,"INVALID_LOGICAL_SLOT"))
         identity_ok=(type(slot)==int and slot in cast and counts[slot]==1
             and isinstance(r.get("character_id"),str)
             and id_counts[r["character_id"]]==1
@@ -522,7 +560,7 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
             and isinstance(evidence,list) and len(evidence)>=2
             and all(isinstance(x,str) and len(x.strip())>=4 for x in evidence)
             and len({x.strip().casefold() for x in evidence})==len(evidence)
-            and _matches(r,slot,cast,character_ids))
+            and match_ok)
         issue=None
         if require_ownership:
             owner=r.get("region_ownership");other=r.get("other_person_pixels");proof=r.get("ownership_evidence")
@@ -544,11 +582,12 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
             eligible.append((index,slot))
         audit.append({"instance_index":index,"slot":slot if type(slot)==int and slot in cast else None,
                       "status":"PRESENT_CONFIRMED" if issue is None else "PRESENT_UNCERTAIN",
-                      "reason":issue})
+                      "reason":issue,"feature_match":match_reason})
     # Contact props can fall inside a person SEG. Never trust a canonical owner
     # while any relevant visible participant claims contradictory prop evidence.
     by_slot={slot:index for index,slot in eligible}
     blocked_slots=set()
+    face_only_contact_slots=set()
     for rel in planner.get("relations",[]):
         if not _relation_has_contact_risk(rel):
             continue
@@ -574,16 +613,36 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
                 blocked_slots.update(int(p[4:]) for p in participants
                                      if int(p[4:]) in by_slot)
             continue
-        if any(not _observed_contact_matches(found[by_slot[int(p[4:])]],rel)
-               for p in participants):
+        unknown_contact=any(not _observed_field_known(
+            found[by_slot[int(p[4:])]].get("observed_contact")) for p in participants)
+        contradictory_contact=any(
+            _observed_field_known(found[by_slot[int(p[4:])]].get("observed_contact"))
+            and not _observed_contact_matches(found[by_slot[int(p[4:])]],rel)
+            for p in participants)
+        if contradictory_contact:
+            # Incorrect ownership is a full stop, not a face-only excuse.
             blocked_slots.update(int(p[4:]) for p in participants)
+        elif unknown_contact:
+            if face_only_unknown_contact:
+                # The face still has its own verified mask and identity.
+                # The whole body's edit mask is disabled downstream.
+                face_only_contact_slots.update(int(p[4:]) for p in participants)
+            else:
+                blocked_slots.update(int(p[4:]) for p in participants)
     candidates=[(index,slot) for index,slot in eligible if slot not in blocked_slots]
     for slot in blocked_slots:
         entry=audit[by_slot[slot]]
         entry["status"]="PRESENT_UNCERTAIN"
         entry["reason"]="CONTACT_OWNER_OR_SHARED_PROP_UNVERIFIED"
+    face_only_contact_slots-=blocked_slots
+    for slot in face_only_contact_slots:
+        audit[by_slot[slot]]["body_policy"]="FACE_ONLY_CONTACT_UNKNOWN"
     used_slots={slot for _,slot in candidates}
-    if not candidates:raise ValueError("zero confidently bound safe people: CatFlat GPU blocked")
+    if not candidates:
+        reasons=[{"instance_index":r["instance_index"],"slot":r["slot"],
+                  "reason":r["reason"],"feature_match":r["feature_match"]}
+                 for r in audit]
+        raise ValueError("zero confidently bound safe people: CatFlat GPU blocked; "+json.dumps(reasons,ensure_ascii=False)[:2000])
     # Build prompts after the *full* visible cast has been verified, so missing
     # actor relations can never be reintroduced into the prompt.
     accepted=[]
@@ -607,6 +666,7 @@ def _bind_response(response,segs,cast,planner,scene,*,require_ownership=False,co
     return selected,wildcard,{"status":"BINDINGS_VERIFIED_BY_RULES_IMAGE_NOT_YET_HUMAN_REVIEWED",
         "accepted":[{"instance_index":i,"slot":slot} for i,slot,_ in accepted],
         "people":audit,"missing":missing_status,"generated_person_count":len(accepted),
+        "face_only_contact_slots":sorted(face_only_contact_slots),
         "protection_limits":{"mask_outside_union":"COMPOSITOR_POLICY_STATIC_ONLY",
          "contact_props_inside_union":"NOT_PIXEL_PROVEN",
          "expression_action_after_catflat":"NOT_VISUALLY_VERIFIED"}}
@@ -789,6 +849,67 @@ class NexusImpactPrepare:
         return image_out,(header,[r["seg"] for r in safe]),json.dumps(meta,ensure_ascii=False),""
 
 
+def _persist_bind_failure(error,vlm_response,geometry_report,active_count):
+    """Preserve a bounded failure receipt without ever returning a fake Final.
+
+    This writes only sanitized VLM identity attributes to the local ComfyUI
+    output directory. No image, raw prompt, API key, URL or full JSON capsule.
+    A disk/logging failure MUST NOT conceal the original fail-closed exception.
+    """
+    if geometry_report is None:
+        return  # Legacy tests/calls have no verified C09 geometry contract.
+    import datetime
+    import logging
+    import uuid
+    from pathlib import Path
+    def short(value):
+        return value[:96] if isinstance(value,str) else None
+    payload={
+        "format":"NEXUS_BIND_FAILURE_V1",
+        "status":"FAIL_CLOSED_NO_FINAL",
+        "time_utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "exception_type":type(error).__name__,
+        "reason":str(error)[:1800],
+        "requested_count":active_count if type(active_count)==int else None,
+        "people":[],
+        "diagnostic_network_requests":0,  # Writer itself never transmits; upstream VLM may have run.
+    }
+    try:
+        obj=_strict_json(vlm_response)
+        for row in obj.get("bindings",[])[:4]:
+            if not isinstance(row,dict):continue
+            traits=row.get("observed_features")
+            bounded={}
+            if isinstance(traits,dict):
+                for key in ("hair","eyes","accessory","outfit"):
+                    values=traits.get(key)
+                    bounded[key]=[short(v) for v in values[:12] if isinstance(v,str)] if isinstance(values,list) else []
+            payload["people"].append({
+                "instance_index":row.get("instance_index") if type(row.get("instance_index"))==int else None,
+                "slot":row.get("slot") if type(row.get("slot"))==int else None,
+                "character_id":short(row.get("character_id")),
+                "status":short(row.get("status")),
+                "confidence":short(row.get("confidence")),
+                "observed_features":bounded,
+                "observed_contact_state":"KNOWN" if _observed_field_known(row.get("observed_contact")) else "UNKNOWN",
+            })
+    except (ValueError,TypeError,AttributeError):
+        payload["vlm_response"]="INVALID_JSON_OR_SHAPE"
+    serialized=json.dumps(payload,ensure_ascii=False,sort_keys=True)
+    logger=logging.getLogger("EagleNexus")
+    logger.error("NEXUS_BIND_FAIL_CLOSED %s",serialized[:6000])
+    try:
+        import folder_paths
+        out=Path(folder_paths.get_output_directory()).resolve()/"eagle_nexus_bind_audit"
+        out.mkdir(parents=True,exist_ok=True)
+        filename=out/("bind_failure_"+uuid.uuid4().hex+".json")
+        with filename.open("x",encoding="utf-8") as f:
+            f.write(serialized+"\n")
+        logger.error("NEXUS_BIND_FAILURE_AUDIT_SAVED %s",str(filename))
+    except Exception as audit_exc:
+        logger.error("NEXUS_BIND_FAILURE_AUDIT_WRITE_FAILED %s",type(audit_exc).__name__)
+
+
 class NexusImpactBind:
     @classmethod
     def INPUT_TYPES(cls):return {"required":{
@@ -807,6 +928,17 @@ class NexusImpactBind:
     CATEGORY="Eagle Nexus/Existing-node bridge"
 
     def bind(self,safe_segs,vlm_response,planner,scene,active_count,logical1,logical2,logical3,logical4,raw_person_segs=None,prop_review_id="",manual_prop_mask=None,geometry_report=None,image=None,identity_ledger=None):
+        try:
+            return self._bind_checked(
+                safe_segs,vlm_response,planner,scene,active_count,logical1,logical2,logical3,logical4,
+                raw_person_segs=raw_person_segs,prop_review_id=prop_review_id,
+                manual_prop_mask=manual_prop_mask,geometry_report=geometry_report,
+                image=image,identity_ledger=identity_ledger)
+        except Exception as exc:
+            _persist_bind_failure(exc,vlm_response,geometry_report,active_count)
+            raise
+
+    def _bind_checked(self,safe_segs,vlm_response,planner,scene,active_count,logical1,logical2,logical3,logical4,raw_person_segs=None,prop_review_id="",manual_prop_mask=None,geometry_report=None,image=None,identity_ledger=None):
         if type(active_count)!=int or not 1<=active_count<=4:
             raise ValueError("expected logical people must be in 1..4")
         cast={i:v for i,v in enumerate((logical1,logical2,logical3,logical4),1) if i<=active_count}
@@ -826,7 +958,8 @@ class NexusImpactBind:
             actual_body=raw_support(raw_person_segs,(height,width))
             if meta.get("raw_body_hash")!=hashlib.sha256(np.packbits(actual_body).tobytes()).hexdigest():raise ValueError("Raw body changed after observation")
         selected,wildcard,audit=_bind_response(vlm_response,safe_segs,cast,contract,scene,
-                                             require_ownership=modern,contact_protected=modern,preserve_observed=modern,character_ids=character_ids)
+                                             require_ownership=modern,contact_protected=modern,preserve_observed=modern,character_ids=character_ids,
+                                             face_only_unknown_contact=modern)
         if modern and (meta.get("skipped") or meta.get("unassigned_raw_person_regions")):
             for row in audit["missing"]:
                 row["status"]="UNCONFIRMED";row["reason"]="OTHER_DETECTED_FACES_EXCLUDED_NOT_PROVEN_MISSING"
@@ -836,6 +969,7 @@ class NexusImpactBind:
         if modern:
             pairs=[(x["instance_index"],x["slot"]) for x in audit["accepted"]];accepted_slots={slot for _,slot in pairs}
             observations={r["instance_index"]:r for r in _strict_json(vlm_response)["bindings"]}
+            face_only_slots=set(audit.get("face_only_contact_slots",[]))
             observed_plan=dict(contract);intent=[]
             for index,slot in pairs:
                 observed=observations[index]
@@ -845,7 +979,8 @@ class NexusImpactBind:
                                for kind in ("action","pose"))
                 body_known=body_known and observed.get("region_ownership")=="single_person" and observed.get("other_person_pixels") is False
                 if not face_known:rows[index]["face"]=np.zeros((height,width),bool)
-                if not body_known:rows[index]["edit"]=np.zeros((height,width),bool)
+                if not body_known or slot in face_only_slots:
+                    rows[index]["edit"]=np.zeros((height,width),bool)
                 for kind in ("expression","gaze","action","pose"):
                     value=observed.get("observed_"+kind)
                     matched=_visual_semantics_match(contract.get(f"slot{slot}_{kind}"),value,kind)
