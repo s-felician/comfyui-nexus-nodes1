@@ -489,7 +489,7 @@ def _strip_negated_object_claims(text):
     return re.sub(
         r"\b(?:no|without)\s+(?:(?:visible|physical|handheld|hand held|separate|any)\s+){0,2}"
         r"(?:object\s+)?(?:props?|objects?|items?)\b"
-        r"|\bnot\s+holding\s+(?:an?\s+|the\s+)?(?:separate\s+)?(?:props?|objects?|items?)\b",
+        r"|\b(?:not|never)\s+hold\w*\s+(?:(?:any|a|an|the|separate|physical|handheld)\s+){0,3}(?:props?|objects?|items?)\b",
         " ",text,flags=re.I)
 
 
@@ -563,6 +563,12 @@ def _contact_verdict(record,rel,instance_to_slot=None):
 
     if person_relation:
         clean=negative_props
+        # Not holding a camera is NOT evidence of not holding someone's hand.
+        # Keep the prop name for background protection, which is assessed
+        # independently using the unmodified observation.
+        for named in _CONTACT_OBJECTS:
+            clean=re.sub(r"\b(?:not|never)\s+hold\w*\s+(?:a\s+|an\s+|any\s+|the\s+)?"
+                         +re.escape(named)+r"\b"," ",clean)
         # Only negation governing actual touch is contrary evidence. "no object
         # prop" and "without a prop" say nothing about hand-to-hand contact.
         if (re.search(r"\b(?:no|without)\s+(?:(?:actual|visible|physical|direct|separate)\s+){0,2}(?:hand\s+to\s+hand\s+|hand\s+)?(?:contact|touch\w*|handholding)\b",clean)
